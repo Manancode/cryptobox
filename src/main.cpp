@@ -20,7 +20,6 @@ const char* merchantAddress = "0x7263B2E0D541206724a20f397296Bf43d86005F8";
 unsigned long lastPaymentCheck = 0;
 const unsigned long paymentCheckInterval = 10000;  // Check every 10 seconds
 String lastProcessedTx = "";
-float ethToInr = 150000;  // 1 ETH = 150,000 INR (example value)
 
 Preferences preferences;
 DFRobotDFPlayerMini myDFPlayer;
@@ -33,12 +32,12 @@ void saveLastProcessedTx(const String &txHash);
 String getLastProcessedTx();
 void playNumberSound(int number);
 void playDecimalSound(int decimal);
+float getEthToInrRate();
 
 void setup() {
   Serial.begin(115200);
   Serial.println("Cryptobox Startup");
   
-  // Initialize components
   Serial2.begin(9600);
   if (!myDFPlayer.begin(Serial2)) {
     Serial.println("DFPlayer Mini initialization failed.");
@@ -68,16 +67,6 @@ void loop() {
   }
 }
 
-void connectToWifi() {
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nConnected to WiFi");
-}
-
 void checkForNewTransactions() {
   HTTPClient http;
   String url = String(apiEndpoint) + 
@@ -87,20 +76,14 @@ void checkForNewTransactions() {
                "&startblock=0" +
                "&endblock=99999999" +
                "&sort=desc" +
-               "&offset=1" +  
+               "&offset=1" +  // We only need the latest transaction
                "&apikey=" + apiKey;
-  
-  Serial.println("Sending HTTP request to: " + url);
   
   http.begin(url);
   int httpResponseCode = http.GET();
   
-  Serial.println("HTTP Response Code: " + String(httpResponseCode));
-  
   if (httpResponseCode == 200) {
     String response = http.getString();
-    Serial.println("API Response: " + response);
-    
     DynamicJsonDocument doc(8192);
     DeserializationError error = deserializeJson(doc, response);
     
@@ -113,12 +96,9 @@ void checkForNewTransactions() {
         String to = tx["to"].as<String>();
         String value = tx["value"].as<String>();
         
-        Serial.println("Latest transaction hash: " + hash);
-        Serial.println("To address: " + to);
-        Serial.println("Value: " + value);
-        
         if (hash != lastProcessedTx && to.equalsIgnoreCase(merchantAddress)) {
           float ether = value.toFloat() / 1e18;
+          float ethToInr = getEthToInrRate();  // Get current ETH to INR rate
           float inrAmount = ether * ethToInr;
           
           Serial.println("New transaction detected!");
@@ -130,14 +110,9 @@ void checkForNewTransactions() {
         } else {
           Serial.println("No new transaction detected.");
         }
-      } else {
-        Serial.println("No transactions found in the response.");
       }
     } else {
       Serial.println("Error parsing JSON or invalid API response");
-      if (error) {
-        Serial.println("Deserialization error: " + String(error.c_str()));
-      }
     }
   } else {
     Serial.println("Error on HTTP request. Response code: " + String(httpResponseCode));
@@ -145,45 +120,59 @@ void checkForNewTransactions() {
   http.end();
 }
 
+float getEthToInrRate() {
+  // In a real-world scenario, you would fetch this from a reliable API
+  // For now, we'll use a placeholder value
+  return 150000.0;  // 1 ETH = 150,000 INR
+}
+
 void playSound(float amount) {
   int rupees = (int)amount;
   int paise = (int)((amount - rupees) * 100);
   
+  // Play the amount
   if (rupees >= 10000000) {
     playNumberSound(rupees / 10000000);
     myDFPlayer.play(204);  // "crore"
     rupees %= 10000000;
+    delay(1000);
   }
   
   if (rupees >= 100000) {
     playNumberSound(rupees / 100000);
     myDFPlayer.play(203);  // "lakh"
     rupees %= 100000;
+    delay(1000);
   }
   
   if (rupees >= 1000) {
     playNumberSound(rupees / 1000);
     myDFPlayer.play(202);  // "thousand"
     rupees %= 1000;
+    delay(1000);
   }
   
   if (rupees >= 100) {
     playNumberSound(rupees / 100);
     myDFPlayer.play(201);  // "hundred"
     rupees %= 100;
+    delay(1000);
   }
   
   if (rupees > 0) {
     playNumberSound(rupees);
+    delay(1000);
   }
   
   if (paise > 0) {
     myDFPlayer.play(200);  // "point"
+    delay(1000);
     playDecimalSound(paise);
+    delay(1000);
   }
   
   myDFPlayer.play(205);  // "rupees"
-  delay(1000);  // Wait for "rupees" to finish playing
+  delay(1000);
 }
 
 void playNumberSound(int number) {
@@ -191,12 +180,12 @@ void playNumberSound(int number) {
     myDFPlayer.play(number);
   } else if (number < 100) {
     myDFPlayer.play((number / 10) * 10);
+    delay(800);
     if (number % 10 != 0) {
-      delay(800);
       myDFPlayer.play(number % 10);
     }
   }
-  delay(800);  // Wait for the number to finish playing
+  delay(800);
 }
 
 void playDecimalSound(int decimal) {
@@ -206,8 +195,8 @@ void playDecimalSound(int decimal) {
     int tens = decimal / 10;
     int ones = decimal % 10;
     playNumberSound(tens * 10);
+    delay(800);
     if (ones > 0) {
-      delay(800);
       playNumberSound(ones);
     }
   }
@@ -223,4 +212,14 @@ String getLastProcessedTx() {
   String tx = preferences.getString("lastTx", "");
   Serial.println("Retrieved last processed transaction: " + tx);
   return tx;
+}
+
+void connectToWifi() {
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected to WiFi");
 }
