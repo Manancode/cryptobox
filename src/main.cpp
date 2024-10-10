@@ -5,7 +5,7 @@
 #include <Preferences.h>
 #include <DFRobotDFPlayerMini.h>
 
-// WiFi credentials
+// WiFi credentials ( will add later in .env)
 const char* ssid = "Piedpiper";
 const char* password = "piedpipermr";
 
@@ -13,18 +13,18 @@ const char* password = "piedpipermr";
 const char* apiEndpoint = "https://api-sepolia.etherscan.io/api";
 const char* apiKey = "Q7YB5BHRA9J4R7KS5T9BHV4W4Q3C74JG6C";
 
-// Merchant details
+// Merchant-details
 const char* merchantAddress = "0x7263B2E0D541206724a20f397296Bf43d86005F8";
 
-// Global variables
 unsigned long lastPaymentCheck = 0;
-const unsigned long paymentCheckInterval = 10000;  // Check every 10 seconds
+const unsigned long paymentCheckInterval = 10000; //checking every 10secs
 String lastProcessedTx = "";
+float ethToInr = 150000;  // 1 ETH = 150,000 INR (example value)
 
 Preferences preferences;
 DFRobotDFPlayerMini myDFPlayer;
 
-// Function declarations
+// Functions
 void connectToWifi();
 void checkForNewTransactions();
 void playSound(float amount);
@@ -36,14 +36,14 @@ float getEthToInrRate();
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("Cryptobox Startup");
+  Serial.println("Cryptobox Startup"); //loggings(will remove later)
   
   Serial2.begin(9600);
   if (!myDFPlayer.begin(Serial2)) {
     Serial.println("DFPlayer Mini initialization failed.");
     return;
   }
-  myDFPlayer.volume(30);  // Set volume (0-30)
+  myDFPlayer.volume(30);  // volume (0-30)
   
   preferences.begin("crypto-box", false);
   lastProcessedTx = getLastProcessedTx();
@@ -52,6 +52,7 @@ void setup() {
   Serial.println("Setup complete. Ready to check for transactions.");
 }
 
+//still some bugs
 void loop() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi disconnected. Reconnecting...");
@@ -185,7 +186,7 @@ void playNumberSound(int number) {
       myDFPlayer.play(number % 10);
     }
   }
-  delay(800);
+  delay(800);  // Wait for the number to finish playing
 }
 
 void playDecimalSound(int decimal) {
@@ -212,14 +213,4 @@ String getLastProcessedTx() {
   String tx = preferences.getString("lastTx", "");
   Serial.println("Retrieved last processed transaction: " + tx);
   return tx;
-}
-
-void connectToWifi() {
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nConnected to WiFi");
 }
