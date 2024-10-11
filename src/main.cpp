@@ -5,7 +5,7 @@
 #include <Preferences.h>
 #include <DFRobotDFPlayerMini.h>
 
-// WiFi credentials ( will add later in .env)
+// WiFi credentials
 const char* ssid = "Piedpiper";
 const char* password = "piedpipermr";
 
@@ -13,18 +13,18 @@ const char* password = "piedpipermr";
 const char* apiEndpoint = "https://api-sepolia.etherscan.io/api";
 const char* apiKey = "Q7YB5BHRA9J4R7KS5T9BHV4W4Q3C74JG6C";
 
-// Merchant-details
+// Merchant details
 const char* merchantAddress = "0x7263B2E0D541206724a20f397296Bf43d86005F8";
 
+// Global variables
 unsigned long lastPaymentCheck = 0;
-const unsigned long paymentCheckInterval = 10000; //checking every 10secs
+const unsigned long paymentCheckInterval = 10000;  // Check every 10 seconds
 String lastProcessedTx = "";
-float ethToInr = 150000;  // 1 ETH = 150,000 INR (example value)
 
 Preferences preferences;
 DFRobotDFPlayerMini myDFPlayer;
 
-// Functions
+// Function declarations
 void connectToWifi();
 void checkForNewTransactions();
 void playSound(float amount);
@@ -36,15 +36,52 @@ float getEthToInrRate();
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("Cryptobox Startup"); //loggings(will remove later)
+  Serial.println("Cryptobox Startup");
   
   Serial2.begin(9600);
+  Serial.println("Initializing DFPlayer...");
+  
+    // Try to initialize the DFPlayer
+  int retries = 0;
+  while (!myDFPlayer.begin(Serial2) && retries < 5) {
+    Serial.println("Failed to initialize DFPlayer. Retrying...");
+    delay(1000);
+    retries++;
+  }
+  
+  if (retries == 5) {
+    Serial.println("DFPlayer Mini initialization failed after 5 attempts. Please check:");
+    Serial.println("1) Connections: Ensure TX/RX pins are correctly connected");
+    Serial.println("2) SD card: Make sure it's properly inserted");
+    Serial.println("3) SD card format: Should be FAT32");
+    Serial.println("4) Audio files: Verify they are in the root directory and in .mp3 format");
+    Serial.println("5) Power supply: Ensure stable power to the DFPlayer");
+    while(true);  // Don't proceed if DFPlayer fails to initialize
+  }
+
+  Serial.println("DFPlayer initialized successfully");
+  
+  // Set volume and verify it
+  myDFPlayer.volume(30);  // Set volume (0-30)
+  delay(100);
+  int currentVolume = myDFPlayer.readVolume();
+  Serial.print("Current volume: ");
+  Serial.println(currentVolume);
+  
+  // Play a test sound
+  Serial.println("Playing test sound...");
+  myDFPlayer.play(1);  // Play the first track
+  delay(2000);  // Wait for 2 seconds
+  myDFPlayer.pause();  // Pause playback
+  
+  Serial.println("DFPlayer setup complete");
+
+
   if (!myDFPlayer.begin(Serial2)) {
     Serial.println("DFPlayer Mini initialization failed.");
     return;
   }
-  myDFPlayer.volume(30);  // volume (0-30)
-  
+  myDFPlayer.volume(30);  // Set volume (0-30)
   preferences.begin("crypto-box", false);
   lastProcessedTx = getLastProcessedTx();
   
@@ -52,7 +89,6 @@ void setup() {
   Serial.println("Setup complete. Ready to check for transactions.");
 }
 
-//still some bugs
 void loop() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi disconnected. Reconnecting...");
@@ -70,6 +106,9 @@ void loop() {
 
 void checkForNewTransactions() {
   HTTPClient http;
+  unsigned long currentTimestamp = time(nullptr);
+  unsigned long startTime = currentTimestamp - 300;
+
   String url = String(apiEndpoint) + 
                "?module=account" +
                "&action=txlist" +
@@ -91,11 +130,11 @@ void checkForNewTransactions() {
     if (!error && doc["status"] == "1" && doc["message"] == "OK") {
       JsonArray txs = doc["result"].as<JsonArray>();
       
-      if (txs.size() > 0) {
-        JsonObject tx = txs[0];
+      for (JsonObject tx : txs) {
         String hash = tx["hash"].as<String>();
         String to = tx["to"].as<String>();
         String value = tx["value"].as<String>();
+        unsigned long txTimestamp = tx["timeStamp"].as<unsigned long>();
         
         if (hash != lastProcessedTx && to.equalsIgnoreCase(merchantAddress)) {
           float ether = value.toFloat() / 1e18;
@@ -108,6 +147,7 @@ void checkForNewTransactions() {
           
           playSound(inrAmount);
           saveLastProcessedTx(hash);
+          break;
         } else {
           Serial.println("No new transaction detected.");
         }
@@ -186,7 +226,7 @@ void playNumberSound(int number) {
       myDFPlayer.play(number % 10);
     }
   }
-  delay(800);  // Wait for the number to finish playing
+  delay(800);
 }
 
 void playDecimalSound(int decimal) {
@@ -213,4 +253,14 @@ String getLastProcessedTx() {
   String tx = preferences.getString("lastTx", "");
   Serial.println("Retrieved last processed transaction: " + tx);
   return tx;
+}
+
+void connectToWifi() {
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected to WiFi");
 }
