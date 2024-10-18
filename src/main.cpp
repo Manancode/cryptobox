@@ -1,170 +1,288 @@
 #include <Arduino.h>
+#include <ArduinoWebsockets.h>
 #include <WiFi.h>
-#include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <DFRobotDFPlayerMini.h>
+#include <HTTPClient.h>
+
+using namespace websockets;
 
 // WiFi credentials
 const char* ssid = "Piedpiper";
 const char* password = "piedpipermr";
 
-// API details
-const char* apiEndpoint = "https://api-sepolia.etherscan.io/api";
-const char* apiKey = "Q7YB5BHRA9J4R7KS5T9BHV4W4Q3C74JG6C";
+// Alchemy WebSocket details
+const char* websocket_url = "wss://eth-sepolia.g.alchemy.com/v2/2tFzzpbSHKxUmfmVaeMcF4H3ACJVxG9d";  // Full WSS URL
+
+// Ethereum HTTP endpoint (for JSON-RPC requests)
+const char* httpEndpoint = "https://eth-sepolia.g.alchemy.com/v2/2tFzzpbSHKxUmfmVaeMcF4H3ACJVxG9d";
 
 // Merchant details
 const char* merchantAddress = "0x7263B2E0D541206724a20f397296Bf43d86005F8";
 
-// Global variables
-unsigned long lastPaymentCheck = 0;
-const unsigned long paymentCheckInterval = 10000;  // Check every 10 seconds
-String lastProcessedTx = "";
+// Exchange rate API endpoint
+const char* exchangeRateApi = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=inr";
 
+// Button pin
+const int BUTTON_PIN = 2;  // Change this to the actual pin you're using
+
+// Global variables
 Preferences preferences;
 DFRobotDFPlayerMini myDFPlayer;
+WebsocketsClient client;
+float lastTransactionAmount = 0.0; // Debounce time in milliseconds
+
+// Constants for WebSocket management
+const unsigned long KEEP_ALIVE_INTERVAL = 30000;  // 30 seconds
+const unsigned long RECONNECT_INTERVAL = 5000;    // 5 seconds
+const int MAX_RECONNECT_ATTEMPTS = 5;
+
+// Constants for rate limiting
+const int MAX_WS_CONNECTIONS = 20000;  // per API key
+const int MAX_SUBSCRIPTIONS = 1000;    // per connection
+const int MAX_BATCH_SIZE = 20;         // per WebSocket request
+
+// Global variables for connection management
+unsigned long lastPingTime = 0;
+unsigned long lastReconnectAttempt = 0;
+int reconnectAttempts = 0;
+bool isSubscribed = false;
 
 // Function declarations
 void connectToWifi();
-void checkForNewTransactions();
+bool setupWebSocket();
+void onMessageCallback(WebsocketsMessage message);
+void onEventsCallback(WebsocketsEvent event, String data);
 void playSound(float amount);
-void saveLastProcessedTx(const String &txHash);
+void saveLastProcessedTx(const String &txHash, float amount);
 String getLastProcessedTx();
+void processTransaction(const String& txHash, const String& value);
 void playNumberSound(int number);
 void playDecimalSound(int decimal);
 float getEthToInrRate();
+String makeHttpRequest(const String& method, const String& params);
+void subscribeToTransactions();
+
+void onMessageCallback(WebsocketsMessage message) {
+    Serial.println("Received message: " + message.data());
+    
+    DynamicJsonDocument doc(2048);
+    DeserializationError error = deserializeJson(doc, message.data());
+    
+    if (error) {
+        Serial.println("Failed to parse WebSocket payload: " + String(error.c_str()));
+        return;
+    }
+    
+    // Handle subscription confirmation
+    if (doc.containsKey("id") && doc.containsKey("result")) {
+        String subscriptionId = doc["result"].as<String>();
+        Serial.println("Subscription confirmed with ID: " + subscriptionId);
+        return;
+    }
+    
+    // Handle transaction notifications - specific to alchemy_minedTransactions format
+    if (doc.containsKey("params") && 
+        doc["params"].containsKey("result") && 
+        doc["params"]["result"].containsKey("transaction")) {
+        
+        JsonObject transaction = doc["params"]["result"]["transaction"];
+        bool removed = doc["params"]["result"]["removed"] | false;
+        
+        if (!removed) {  // Only process transactions that haven't been removed
+            const char* to = transaction["to"];
+            if (to && strcasecmp(to, merchantAddress) == 0) {
+                String txHash = transaction["hash"].as<String>();
+                String value = transaction["value"].as<String>();
+                
+                if (txHash != getLastProcessedTx()) {
+                    Serial.println("New confirmed transaction detected!");
+                    Serial.println("Hash: " + txHash);
+                    processTransaction(txHash, value);
+                }
+            }
+        }
+    }
+}
+
+void processTransaction(const String& txHash, const String& value) {
+    // Convert hex value to Wei
+    uint64_t wei = strtoull(value.c_str(), NULL, 16);
+    // Convert Wei to Ether
+    float ether = (float)wei / 1e18;
+    
+    // Get current exchange rate
+    float ethToInr = getEthToInrRate();
+    float inrAmount = ether * ethToInr;
+    
+    Serial.printf("Transaction amount: %f ETH = %f INR\n", ether, inrAmount);
+    
+    // Play sound and save transaction
+    playSound(inrAmount);
+    saveLastProcessedTx(txHash, inrAmount);
+}
+
+void onEventsCallback(WebsocketsEvent event, String data) {
+  if(event == WebsocketsEvent::ConnectionOpened) {
+    Serial.println("WebSocket Connection Opened");
+    // Subscribe to pending transactions
+    String subscribeMsg = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_subscribe\",\"params\":[\"alchemy_pendingTransactions\",{\"toAddress\":\"" + String(merchantAddress) + "\"}]}";
+    client.send(subscribeMsg);
+  } else if(event == WebsocketsEvent::ConnectionClosed) {
+    Serial.println("WebSocket Connection Closed");
+  } else if(event == WebsocketsEvent::GotPing) {
+    Serial.println("Got a Ping!");
+  } else if(event == WebsocketsEvent::GotPong) {
+    Serial.println("Got a Pong!");
+  }
+}
 
 void setup() {
   Serial.begin(115200);
   Serial.println("Cryptobox Startup");
+  delay(1000);
   
   Serial2.begin(9600);
-  Serial.println("Initializing DFPlayer...");
-  
-    // Try to initialize the DFPlayer
-  int retries = 0;
-  while (!myDFPlayer.begin(Serial2) && retries < 5) {
-    Serial.println("Failed to initialize DFPlayer. Retrying...");
-    delay(1000);
-    retries++;
-  }
-  
-  if (retries == 5) {
-    Serial.println("DFPlayer Mini initialization failed after 5 attempts. Please check:");
-    Serial.println("1) Connections: Ensure TX/RX pins are correctly connected");
-    Serial.println("2) SD card: Make sure it's properly inserted");
-    Serial.println("3) SD card format: Should be FAT32");
-    Serial.println("4) Audio files: Verify they are in the root directory and in .mp3 format");
-    Serial.println("5) Power supply: Ensure stable power to the DFPlayer");
-    while(true);  // Don't proceed if DFPlayer fails to initialize
-  }
-
-  Serial.println("DFPlayer initialized successfully");
-  
-  // Set volume and verify it
-  myDFPlayer.volume(30);  // Set volume (0-30)
-  delay(100);
-  int currentVolume = myDFPlayer.readVolume();
-  Serial.print("Current volume: ");
-  Serial.println(currentVolume);
-  
-  // Play a test sound
-  Serial.println("Playing test sound...");
-  myDFPlayer.play(1);  // Play the first track
-  delay(2000);  // Wait for 2 seconds
-  myDFPlayer.pause();  // Pause playback
-  
-  Serial.println("DFPlayer setup complete");
-
-
   if (!myDFPlayer.begin(Serial2)) {
     Serial.println("DFPlayer Mini initialization failed.");
-    return;
+    // Don't return here, continue with the rest of the setup
+  } else {
+    Serial.println("DFPlayer Mini initialized successfully.");
   }
-  myDFPlayer.volume(30);  // Set volume (0-30)
+
+  Serial.println("Initializing preferences...");
   preferences.begin("crypto-box", false);
-  lastProcessedTx = getLastProcessedTx();
+  Serial.println("Preferences initialized.");
   
+  Serial.println("Setting up button pin...");
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  Serial.println("Button pin setup complete.");
+  
+  Serial.println("Attempting to connect to WiFi...");
   connectToWifi();
-  Serial.println("Setup complete. Ready to check for transactions.");
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi connection failed. Restarting in 10 seconds...");
+    delay(10000);
+    ESP.restart();
+
+  }
+
+  
+  // Attempt to connect to WebSocket
+  Serial.println("Attempting to connect to WebSocket...");
+  if (!setupWebSocket()) {
+    Serial.println("Initial WebSocket connection failed. Will retry in loop.");
+  } else {
+    Serial.println("WebSocket connected successfully.");
+  }
+  
+  Serial.println("Setup complete. Listening for transactions...");
 }
 
 void loop() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi disconnected. Reconnecting...");
-    connectToWifi();
-    return;
-  }
-  
-  unsigned long currentMillis = millis();
-  if (currentMillis - lastPaymentCheck >= paymentCheckInterval) {
-    Serial.println("Checking for new transactions...");
-    checkForNewTransactions();
-    lastPaymentCheck = currentMillis;
-  }
+    unsigned long currentTime = millis();
+    
+    // Check WebSocket connection
+    if (!client.available()) {
+        if (currentTime - lastReconnectAttempt >= RECONNECT_INTERVAL) {
+            lastReconnectAttempt = currentTime;
+            
+            if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+                Serial.println("Attempting to reconnect...");
+                reconnectAttempts++;
+                isSubscribed = false;
+                
+                if (setupWebSocket()) {
+                    Serial.println("Reconnected successfully");
+                } else {
+                    Serial.printf("Reconnection attempt %d failed\n", reconnectAttempts);
+                }
+            } else {
+                Serial.println("Max reconnection attempts reached. Restarting device...");
+                ESP.restart();
+            }
+        }
+    } else {
+        // Handle WebSocket maintenance
+        if (currentTime - lastPingTime >= KEEP_ALIVE_INTERVAL) {
+            lastPingTime = currentTime;
+            client.ping();
+        }
+        
+        client.poll();
+    }
 }
 
-void checkForNewTransactions() {
-  HTTPClient http;
-  unsigned long currentTimestamp = time(nullptr);
-  unsigned long startTime = currentTimestamp - 300;
+bool setupWebSocket() {
+  client.onMessage(onMessageCallback);
+  client.onEvent(onEventsCallback);
+  //  client.setInsecure(); //enable ssl
 
-  String url = String(apiEndpoint) + 
-               "?module=account" +
-               "&action=txlist" +
-               "&address=" + merchantAddress +
-               "&startblock=0" +
-               "&endblock=99999999" +
-               "&sort=desc" +
-               "&offset=1" +  // We only need the latest transaction
-               "&apikey=" + apiKey;
-  
-  http.begin(url);
-  int httpResponseCode = http.GET();
-  
-  if (httpResponseCode == 200) {
-    String response = http.getString();
-    DynamicJsonDocument doc(8192);
-    DeserializationError error = deserializeJson(doc, response);
-    
-    if (!error && doc["status"] == "1" && doc["message"] == "OK") {
-      JsonArray txs = doc["result"].as<JsonArray>();
-      
-      for (JsonObject tx : txs) {
-        String hash = tx["hash"].as<String>();
-        String to = tx["to"].as<String>();
-        String value = tx["value"].as<String>();
-        unsigned long txTimestamp = tx["timeStamp"].as<unsigned long>();
-        
-        if (hash != lastProcessedTx && to.equalsIgnoreCase(merchantAddress)) {
-          float ether = value.toFloat() / 1e18;
-          float ethToInr = getEthToInrRate();  // Get current ETH to INR rate
-          float inrAmount = ether * ethToInr;
-          
-          Serial.println("New transaction detected!");
-          Serial.println("Hash: " + hash);
-          Serial.println("Amount: " + String(inrAmount, 2) + " INR");
-          
-          playSound(inrAmount);
-          saveLastProcessedTx(hash);
-          break;
-        } else {
-          Serial.println("No new transaction detected.");
-        }
-      }
-    } else {
-      Serial.println("Error parsing JSON or invalid API response");
-    }
-  } else {
-    Serial.println("Error on HTTP request. Response code: " + String(httpResponseCode));
+  Serial.println("Connecting to WebSocket...");
+  bool connected = client.connect(websocket_url);
+
+  if (connected) {
+    Serial.println("Connected to WebSocket server");
+    // Subscribe to pending transactions using Alchemy's specific method
+    reconnectAttempts = 0;
+        subscribeToTransactions();
+        return true;
   }
+    Serial.println("WebSocket connection failed!");
+    return false;
+  
+}
+
+void subscribeToTransactions() {
+    if (!isSubscribed) {
+        // Subscribe to mined transactions instead of pending
+        String subscribeMsg = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_subscribe\",\"params\":[\"alchemy_pendingTransactions\",{\"toAddress\":\"" + String(merchantAddress) + "\"}]}";
+        client.send(subscribeMsg);
+        isSubscribed = true;
+        Serial.println("Subscribed to mined transactions");
+    }
+}
+
+
+String makeHttpRequest(const String& method, const String& params) {
+  HTTPClient http;
+  http.begin(httpEndpoint);
+  http.addHeader("Content-Type", "application/json");
+  
+  String payload = "{\"jsonrpc\":\"2.0\",\"method\":\"" + method + "\",\"params\":" + params + ",\"id\":1}";
+  int httpResponseCode = http.POST(payload);
+  
+  String response = "{}";
+  if (httpResponseCode == 200) {
+    response = http.getString();
+  } else {
+    Serial.println("Error on HTTP request: " + String(httpResponseCode));
+  }
+  
   http.end();
+  return response;
 }
 
 float getEthToInrRate() {
-  // In a real-world scenario, you would fetch this from a reliable API
-  // For now, we'll use a placeholder value
-  return 150000.0;  // 1 ETH = 150,000 INR
+  HTTPClient http;
+  http.begin(exchangeRateApi);
+  int httpCode = http.GET();
+  
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    DynamicJsonDocument doc(1024);
+    DeserializationError error = deserializeJson(doc, payload);
+    
+    if (!error) {
+      float rate = doc["ethereum"]["inr"].as<float>();
+      Serial.printf("Current ETH to INR rate: %.2f\n", rate);
+      return rate;
+    }
+  }
+  Serial.println("Failed to get current exchange rate. Using fallback value.");
+  return 80000;
 }
 
 void playSound(float amount) {
@@ -243,24 +361,95 @@ void playDecimalSound(int decimal) {
   }
 }
 
-void saveLastProcessedTx(const String &txHash) {
+void saveLastProcessedTx(const String &txHash, float amount) {
   preferences.putString("lastTx", txHash);
-  lastProcessedTx = txHash;
-  Serial.println("Saved last processed transaction: " + txHash);
+  preferences.putFloat("lastAmount", amount);
+  lastTransactionAmount = amount;
+  Serial.println("Saved last processed transaction: " + txHash + " Amount: " + String(amount, 2) + " INR");
 }
 
 String getLastProcessedTx() {
   String tx = preferences.getString("lastTx", "");
-  Serial.println("Retrieved last processed transaction: " + tx);
+  lastTransactionAmount = preferences.getFloat("lastAmount", 0.0);
+  Serial.println("Retrieved last processed transaction: " + tx + " Amount: " + String(lastTransactionAmount, 2) + " INR");
   return tx;
 }
 
+// void checkButton() {
+//   int buttonState = digitalRead(BUTTON_PIN);
+//   if (buttonState == LOW) {
+//     unsigned long currentMillis = millis();
+//     if (currentMillis - lastButtonPress > debounceDelay) {
+//       lastButtonPress = currentMillis;
+//       Serial.println("Button pressed. Replaying last transaction sound.");
+//       playSound(lastTransactionAmount);
+//     }
+//   }
+// }
+
 void connectToWifi() {
+  Serial.println("Inside connectToWifi function");
+  WiFi.mode(WIFI_STA);
+  Serial.printf("Attempting to connect to SSID: %s\n", ssid);
   WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(1000);
     Serial.print(".");
+    attempts++;
   }
-  Serial.println("\nConnected to WiFi");
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nConnected to WiFi");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("Signal strength (RSSI): ");
+    Serial.println(WiFi.RSSI());
+  } else {
+    Serial.println("\nFailed to connect to WiFi.");
+    Serial.print("WiFi status: ");
+    Serial.println(WiFi.status());
+  }
+}
+
+void handleWebSocketError(int errorCode) {
+    switch(errorCode) {
+        case 32600:  // Exceeding batch size limit
+            Serial.println("Error: Batch size limit exceeded");
+            delay(5000);  // Wait before retrying
+            setupWebSocket();
+            break;
+            
+        case -1:  // Connection error (custom code)
+            if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+                unsigned long backoff = RECONNECT_INTERVAL * (1 << reconnectAttempts);
+                Serial.printf("Connection error. Retrying in %lu ms\n", backoff);
+                delay(backoff);
+                setupWebSocket();
+            } else {
+                Serial.println("Max reconnection attempts reached. Restarting...");
+                ESP.restart();
+            }
+            break;
+            
+        default:
+            Serial.printf("Unknown WebSocket error: %d\n", errorCode);
+            break;
+    }
+}
+
+bool isRateLimited = false;
+unsigned long rateLimitResetTime = 0;
+
+void checkRateLimits() {
+    if (isRateLimited) {
+        if (millis() > rateLimitResetTime) {
+            isRateLimited = false;
+        } else {
+            return;
+        }
+    }
+    
+    // Implementation would depend on your rate tracking logic
 }
